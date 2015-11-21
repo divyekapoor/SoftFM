@@ -43,6 +43,7 @@ SoftFM has been tested successfully with RTL-SDR 0.5.3.
 To install SoftFM, download and unpack the source code and go to the
 top level directory. Then do like this:
 
+ $ sudo apt-get install libusb-1.0-0-dev librtlsdr-dev libasound2-dev
  $ mkdir build
  $ cd build
  $ cmake ..
