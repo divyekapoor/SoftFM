@@ -287,205 +287,278 @@ double get_time()
     return tv.tv_sec + 1.0e-6 * tv.tv_usec;
 }
 
+void register_signal_handlers() {
+  // Catch Ctrl-C and SIGTERM
+  struct sigaction sigact;
+  sigact.sa_handler = handle_sigterm;
+  sigemptyset(&sigact.sa_mask);
+  sigact.sa_flags = SA_RESETHAND;
+  if (sigaction(SIGINT, &sigact, NULL) < 0) {
+      fprintf(stderr, "WARNING: can not install SIGINT handler (%s)\n",
+              strerror(errno));
+  }
+  if (sigaction(SIGTERM, &sigact, NULL) < 0) {
+      fprintf(stderr, "WARNING: can not install SIGTERM handler (%s)\n",
+              strerror(errno));
+  }
+}
+
+enum OutputMode { MODE_RAW, MODE_WAV, MODE_ALSA };
+struct Options {
+  double  freq    = -1;  // required.
+  int     devidx  = 0;   // -1 if unset. device id otherwise.
+  int     lnagain = INT_MIN;  // INT_MIN if auto, INT_MIN + 1 if list. value * 10 otherwise
+  int     pcmrate = 48000;
+  double  ifrate  = 1.0e6;  // input sampling frequency.
+  bool    agcmode = false;
+  bool    stereo  = true;
+  double  bufsecs = -1;
+
+  OutputMode outmode = MODE_ALSA;
+  string alsadev = "default";
+  string filename;  // used for
+
+  FILE *  ppsfile = NULL;
+
+  double tuner_freq = -1;  // set by code based on freq and ifrate.
+};
+
+
+void validate_devidx(int devidx) {
+  vector<string> devnames = RtlSdrSource::get_device_names();
+  if (devidx < -1 || devidx >= (int) devnames.size()) {
+    fprintf(stderr, "ERROR: invalid device index %d\n", devidx);
+    fprintf(stderr, "Found %u devices:\n", devnames.size());
+    for (size_t i = 0; i < devnames.size(); i++) {
+        fprintf(stderr, "%2u: %s\n", i, devnames[i].c_str());
+    }
+    exit(1);
+  }
+  fprintf(stderr, "using device %d: %s\n", devidx, devnames[devidx].c_str());
+}
+
+FILE* open_ppsfile(const string& ppsfilename) {
+  FILE* ppsfile = nullptr;
+  if (!ppsfilename.empty()) {
+      if (ppsfilename == "-") {
+          fprintf(stderr, "writing pulse-per-second markers to stdout\n");
+          ppsfile = stdout;
+      } else {
+          fprintf(stderr, "writing pulse-per-second markers to '%s'\n",
+                  ppsfilename.c_str());
+          ppsfile = fopen(ppsfilename.c_str(), "w");
+          if (ppsfile == NULL) {
+              fprintf(stderr, "ERROR: can not open '%s' (%s)\n",
+                      ppsfilename.c_str(), strerror(errno));
+              exit(1);
+          }
+      }
+      fprintf(ppsfile, "#pps_index sample_index   unix_time\n");
+      fflush(ppsfile);
+  }
+  return ppsfile;
+}
+
+void parse_options_from_flags(Options* options) {
+  const struct option longopts[] = {
+      { "freq",       1, NULL, 'f' },
+      { "dev",        1, NULL, 'd' },
+      { "gain",       1, NULL, 'g' },
+      { "ifrate",     1, NULL, 's' },
+      { "pcmrate",    1, NULL, 'r' },
+      { "agc",        0, NULL, 'a' },
+      { "mono",       0, NULL, 'M' },
+      { "raw",        1, NULL, 'R' },
+      { "wav",        1, NULL, 'W' },
+      { "play",       2, NULL, 'P' },
+      { "pps",        1, NULL, 'T' },
+      { "buffer",     1, NULL, 'b' },
+      { NULL,         0, NULL, 0 } };
+
+  int c, longindex;
+  while ((c = getopt_long(argc, argv,
+                          "f:d:g:s:r:MR:W:P::T:b:a",
+                          longopts, &longindex)) >= 0) {
+      switch (c) {
+          case 'f':
+              if (!parse_dbl(optarg, options->freq) || options->freq <= 0) {
+                  badarg("-f");
+              }
+              break;
+          case 'd':
+              if (!parse_int(optarg, options->devidx))
+                  options->devidx = -1;
+              validate_devidx(options->devidx);
+              break;
+          case 'g':
+              if (strcasecmp(optarg, "auto") == 0) {
+                  options->lnagain = INT_MIN;
+              } else if (strcasecmp(optarg, "list") == 0) {
+                  options->lnagain = INT_MIN + 1;
+              } else {
+                  double tmpgain;
+                  if (!parse_dbl(optarg, tmpgain)) {
+                      badarg("-g");
+                  }
+                  long int tmpgain2 = lrint(tmpgain * 10);
+                  if (tmpgain2 <= INT_MIN || tmpgain2 >= INT_MAX) {
+                      badarg("-g");
+                  }
+                  options->lnagain = tmpgain2;
+              }
+              break;
+          case 's':
+              // NOTE: RTL does not support some sample rates below 900 kS/s
+              // Also, max sampling rate is 3.2 MS/s
+              if (!parse_dbl(optarg, options->ifrate) ||
+                   (options->ifrate <= 225000) || (options->ifrate > 3200000) ||
+                   ((options->ifrate > 300000) && (options->ifrate <= 900000))) {
+                  badarg("-s");
+              }
+              break;
+          case 'r':
+              if (!parse_int(optarg, options->pcmrate, true) || options->pcmrate < 1) {
+                  badarg("-r");
+              }
+              break;
+          case 'M':
+              options->stereo = false;
+              break;
+          case 'R':
+              options->outmode = MODE_RAW;
+              options->filename = optarg;
+              break;
+          case 'W':
+              options->outmode = MODE_WAV;
+              options->filename = optarg;
+              break;
+          case 'P':
+              options->outmode = MODE_ALSA;
+              if (optarg != NULL)
+                  options->alsadev = optarg;
+              break;
+          case 'T':
+              string ppsfilename = optarg;
+              options->ppsfile = open_ppsfile(ppsfilename);
+              break;
+          case 'b':
+              if (!parse_dbl(optarg, options->bufsecs) || options->bufsecs < 0) {
+                  badarg("-b");
+              }
+              break;
+          case 'a':
+              options->agcmode = true;
+              break;
+          default:
+              usage();
+              fprintf(stderr, "ERROR: Invalid command line option -%c\n", c);
+              exit(1);
+      }
+  }
+
+  if (optind < argc) {
+      usage();
+      fprintf(stderr, "ERROR: Unexpected command line options\n");
+      exit(1);
+  }
+}
+
+void validate_lnagain(const RtlSdrSource& rtlsdr, int lnagain) {
+  if (lnagain != INT_MIN) {
+    vector<int> gains = rtlsdr.get_tuner_gains();
+    if (find(gains.begin(), gains.end(), lnagain) == gains.end()) {
+      if (lnagain != INT_MIN + 1)
+        fprintf(stderr, "ERROR: LNA gain %.1f dB not supported by tuner\n", lnagain * 0.1);
+      fprintf(stderr, "Supported LNA gains: ");
+      for (int g: gains)
+        fprintf(stderr, " %.1f dB ", 0.1 * g);
+      fprintf(stderr, "\n");
+      exit(1);
+    }
+  }
+}
+
+// Creates an RtlSdrSource and updates options to match the source's
+// capabilities. Exits if the source cannot be created.
+RtlSdrSource create_rtlsdr_from_options(Options* options) {
+  // Open RTL-SDR device.
+  RtlSdrSource rtlsdr(options->devidx);
+  if (!rtlsdr) {
+    fprintf(stderr, "ERROR: RtlSdr: %s\n", rtlsdr.error().c_str());
+    exit(1);
+  }
+
+  // Check LNA gain.
+  validate_lnagain(rtlsdr, options->lnagain);
+
+  // Configure RTL-SDR device and start streaming.
+  // Intentionally tune at a higher frequency to avoid DC offset.
+  options->tuner_freq = options->freq + 0.25 * options->ifrate;
+  rtlsdr.configure(
+      options->ifrate,
+      tuner_freq,
+      options->lnagain,
+      RtlSdrSource::default_block_length,
+      options->agcmode);
+  if (!rtlsdr) {
+    fprintf(stderr, "ERROR: RtlSdr: %s\n", rtlsdr.error().c_str());
+    exit(1);
+  }
+
+  options->tuner_freq = rtlsdr.get_frequency();
+  fprintf(stderr, "device tuned for:  %.6f MHz\n", tuner_freq * 1.0e-6);
+
+  if (options->lnagain == INT_MIN)
+    fprintf(stderr, "LNA gain:          auto\n");
+  else
+    fprintf(stderr, "LNA gain:          %.1f dB\n",
+        0.1 * rtlsdr.get_tuner_gain());
+
+  options->ifrate = rtlsdr.get_sample_rate();
+  fprintf(stderr, "IF sample rate:    %.0f Hz\n", ifrate);
+
+  fprintf(stderr, "RTL AGC mode:      %s\n",
+      options->agcmode ? "enabled" : "disabled");
+}
+
+unique_ptr<AudioOutput> create_audio_output_from_options(const Options& options) {
+  unique_ptr<AudioOutput> audio_output;
+  switch (options.outmode) {
+    case MODE_RAW:
+      fprintf(stderr, "writing raw 16-bit audio samples to '%s'\n",
+          filename.c_str());
+      audio_output.reset(new RawAudioOutput(filename));
+      break;
+    case MODE_WAV:
+      fprintf(stderr, "writing audio samples to '%s'\n",
+          filename.c_str());
+      audio_output.reset(new WavAudioOutput(filename, pcmrate, stereo));
+      break;
+    case MODE_ALSA:
+      fprintf(stderr, "playing audio to ALSA device '%s'\n",
+          alsadev.c_str());
+      audio_output.reset(new AlsaAudioOutput(alsadev, pcmrate, stereo));
+      break;
+  }
+
+  if (!(*audio_output)) {
+    fprintf(stderr, "ERROR: AudioOutput: %s\n",
+        audio_output->error().c_str());
+    exit(1);
+  }
+  return std::move(audio_output);
+}
 
 int main(int argc, char **argv)
 {
-    double  freq    = -1;
-    int     devidx  = 0;
-    int     lnagain = INT_MIN;
-    bool    agcmode = false;
-    double  ifrate  = 1.0e6;
-    int     pcmrate = 48000;
-    bool    stereo  = true;
-    enum OutputMode { MODE_RAW, MODE_WAV, MODE_ALSA };
-    OutputMode outmode = MODE_ALSA;
-    string  filename;
-    string  alsadev("default");
-    string  ppsfilename;
-    FILE *  ppsfile = NULL;
-    double  bufsecs = -1;
-
     fprintf(stderr,
             "SoftFM - Software decoder for FM broadcast radio with RTL-SDR\n");
 
-    const struct option longopts[] = {
-        { "freq",       1, NULL, 'f' },
-        { "dev",        1, NULL, 'd' },
-        { "gain",       1, NULL, 'g' },
-        { "ifrate",     1, NULL, 's' },
-        { "pcmrate",    1, NULL, 'r' },
-        { "agc",        0, NULL, 'a' },
-        { "mono",       0, NULL, 'M' },
-        { "raw",        1, NULL, 'R' },
-        { "wav",        1, NULL, 'W' },
-        { "play",       2, NULL, 'P' },
-        { "pps",        1, NULL, 'T' },
-        { "buffer",     1, NULL, 'b' },
-        { NULL,         0, NULL, 0 } };
+    Options options;
+    parse_options_from_flags(&options);
+    register_signal_handlers();
 
-    int c, longindex;
-    while ((c = getopt_long(argc, argv,
-                            "f:d:g:s:r:MR:W:P::T:b:a",
-                            longopts, &longindex)) >= 0) {
-        switch (c) {
-            case 'f':
-                if (!parse_dbl(optarg, freq) || freq <= 0) {
-                    badarg("-f");
-                }
-                break;
-            case 'd':
-                if (!parse_int(optarg, devidx))
-                    devidx = -1;
-                break;
-            case 'g':
-                if (strcasecmp(optarg, "auto") == 0) {
-                    lnagain = INT_MIN;
-                } else if (strcasecmp(optarg, "list") == 0) {
-                    lnagain = INT_MIN + 1;
-                } else {
-                    double tmpgain;
-                    if (!parse_dbl(optarg, tmpgain)) {
-                        badarg("-g");
-                    }
-                    long int tmpgain2 = lrint(tmpgain * 10);
-                    if (tmpgain2 <= INT_MIN || tmpgain2 >= INT_MAX) {
-                        badarg("-g");
-                    }
-                    lnagain = tmpgain2;
-                }
-                break;
-            case 's':
-                // NOTE: RTL does not support some sample rates below 900 kS/s
-                // Also, max sampling rate is 3.2 MS/s
-                if (!parse_dbl(optarg, ifrate) ||
-                     (ifrate <= 225000) || (ifrate > 3200000) ||
-                     ((ifrate > 300000) && (ifrate <= 900000))) {
-                    badarg("-s");
-                }
-                break;
-            case 'r':
-                if (!parse_int(optarg, pcmrate, true) || pcmrate < 1) {
-                    badarg("-r");
-                }
-                break;
-            case 'M':
-                stereo = false;
-                break;
-            case 'R':
-                outmode = MODE_RAW;
-                filename = optarg;
-                break;
-            case 'W':
-                outmode = MODE_WAV;
-                filename = optarg;
-                break;
-            case 'P':
-                outmode = MODE_ALSA;
-                if (optarg != NULL)
-                    alsadev = optarg;
-                break;
-            case 'T':
-                ppsfilename = optarg;
-                break;
-            case 'b':
-                if (!parse_dbl(optarg, bufsecs) || bufsecs < 0) {
-                    badarg("-b");
-                }
-                break;
-            case 'a':
-                agcmode = true;
-                break;
-            default:
-                usage();
-                fprintf(stderr, "ERROR: Invalid command line options\n");
-                exit(1);
-        }
-    }
-
-    if (optind < argc) {
-        usage();
-        fprintf(stderr, "ERROR: Unexpected command line options\n");
-        exit(1);
-    }
-
-    vector<string> devnames = RtlSdrSource::get_device_names();
-    if (devidx < 0 || (unsigned int)devidx >= devnames.size()) {
-        if (devidx != -1)
-            fprintf(stderr, "ERROR: invalid device index %d\n", devidx);
-        fprintf(stderr, "Found %u devices:\n", (unsigned int)devnames.size());
-        for (unsigned int i = 0; i < devnames.size(); i++) {
-            fprintf(stderr, "%2u: %s\n", i, devnames[i].c_str());
-        }
-        exit(1);
-    }
-    fprintf(stderr, "using device %d: %s\n", devidx, devnames[devidx].c_str());
-
-    if (freq <= 0) {
-        usage();
-        fprintf(stderr, "ERROR: Specify a tuning frequency\n");
-        exit(1);
-    }
-
-    // Catch Ctrl-C and SIGTERM
-    struct sigaction sigact;
-    sigact.sa_handler = handle_sigterm;
-    sigemptyset(&sigact.sa_mask);
-    sigact.sa_flags = SA_RESETHAND;
-    if (sigaction(SIGINT, &sigact, NULL) < 0) {
-        fprintf(stderr, "WARNING: can not install SIGINT handler (%s)\n",
-                strerror(errno));
-    }
-    if (sigaction(SIGTERM, &sigact, NULL) < 0) {
-        fprintf(stderr, "WARNING: can not install SIGTERM handler (%s)\n",
-                strerror(errno));
-    }
-
-    // Intentionally tune at a higher frequency to avoid DC offset.
-    double tuner_freq = freq + 0.25 * ifrate;
-
-    // Open RTL-SDR device.
-    RtlSdrSource rtlsdr(devidx);
-    if (!rtlsdr) {
-        fprintf(stderr, "ERROR: RtlSdr: %s\n", rtlsdr.error().c_str());
-        exit(1);
-    }
-
-    // Check LNA gain.
-    if (lnagain != INT_MIN) {
-        vector<int> gains = rtlsdr.get_tuner_gains();
-        if (find(gains.begin(), gains.end(), lnagain) == gains.end()) {
-            if (lnagain != INT_MIN + 1)
-                fprintf(stderr, "ERROR: LNA gain %.1f dB not supported by tuner\n", lnagain * 0.1);
-            fprintf(stderr, "Supported LNA gains: ");
-            for (int g: gains)
-                fprintf(stderr, " %.1f dB ", 0.1 * g);
-            fprintf(stderr, "\n");
-            exit(1);
-        }
-    }
-
-    // Configure RTL-SDR device and start streaming.
-    rtlsdr.configure(ifrate, tuner_freq, lnagain,
-                     RtlSdrSource::default_block_length, agcmode);
-    if (!rtlsdr) {
-        fprintf(stderr, "ERROR: RtlSdr: %s\n", rtlsdr.error().c_str());
-        exit(1);
-    }
-
-    tuner_freq = rtlsdr.get_frequency();
-    fprintf(stderr, "device tuned for:  %.6f MHz\n", tuner_freq * 1.0e-6);
-
-    if (lnagain == INT_MIN)
-        fprintf(stderr, "LNA gain:          auto\n");
-    else
-        fprintf(stderr, "LNA gain:          %.1f dB\n",
-                0.1 * rtlsdr.get_tuner_gain());
-
-    ifrate = rtlsdr.get_sample_rate();
-    fprintf(stderr, "IF sample rate:    %.0f Hz\n", ifrate);
-
-    fprintf(stderr, "RTL AGC mode:      %s\n",
-            agcmode ? "enabled" : "disabled");
+    RtlSdrSource rtlsdr = create_rtlsdr_from_options(&options);
 
     // Create source data queue.
     DataBuffer<IQSample> source_buffer;
@@ -496,91 +569,39 @@ int main(int argc, char **argv)
     // The baseband signal is empty above 100 kHz, so we can
     // downsample to ~ 200 kS/s without loss of information.
     // This will speed up later processing stages.
-    unsigned int downsample = max(1, int(ifrate / 215.0e3));
+    unsigned int downsample = max(1, int(options->ifrate / 215.0e3));
     fprintf(stderr, "baseband downsampling factor %u\n", downsample);
 
     // Prevent aliasing at very low output sample rates.
     double bandwidth_pcm = min(FmDecoder::default_bandwidth_pcm,
-                               0.45 * pcmrate);
-    fprintf(stderr, "audio sample rate: %u Hz\n", pcmrate);
+                               0.45 * options->pcmrate);
+    fprintf(stderr, "audio sample rate: %u Hz\n", options->pcmrate);
     fprintf(stderr, "audio bandwidth:   %.3f kHz\n", bandwidth_pcm * 1.0e-3);
 
-    // Prepare decoder.
-    FmDecoder fm(ifrate,                            // sample_rate_if
-                 freq - tuner_freq,                 // tuning_offset
-                 pcmrate,                           // sample_rate_pcm
-                 stereo,                            // stereo
-                 FmDecoder::default_deemphasis,     // deemphasis,
-                 FmDecoder::default_bandwidth_if,   // bandwidth_if
-                 FmDecoder::default_freq_dev,       // freq_dev
-                 bandwidth_pcm,                     // bandwidth_pcm
-                 downsample);                       // downsample
 
     // Calculate number of samples in audio buffer.
     unsigned int outputbuf_samples = 0;
-    if (bufsecs < 0 &&
+    if (options->bufsecs < 0 &&
         (outmode == MODE_ALSA || (outmode == MODE_RAW && filename == "-"))) {
         // Set default buffer to 1 second for interactive output streams.
-        outputbuf_samples = pcmrate;
-    } else if (bufsecs > 0) {
+        outputbuf_samples = options->pcmrate;
+    } else if (options->bufsecs > 0) {
         // Calculate nr of samples for configured buffer length.
-        outputbuf_samples = (unsigned int)(bufsecs * pcmrate);
+        outputbuf_samples = (unsigned int)(options->bufsecs * options->pcmrate);
     }
     if (outputbuf_samples > 0) {
         fprintf(stderr, "output buffer:     %.1f seconds\n",
-                outputbuf_samples / double(pcmrate));
-    }
-
-    // Open PPS file.
-    if (!ppsfilename.empty()) {
-        if (ppsfilename == "-") {
-            fprintf(stderr, "writing pulse-per-second markers to stdout\n");
-            ppsfile = stdout;
-        } else {
-            fprintf(stderr, "writing pulse-per-second markers to '%s'\n",
-                    ppsfilename.c_str());
-            ppsfile = fopen(ppsfilename.c_str(), "w");
-            if (ppsfile == NULL) {
-                fprintf(stderr, "ERROR: can not open '%s' (%s)\n",
-                        ppsfilename.c_str(), strerror(errno));
-                exit(1);
-            }
-        }
-        fprintf(ppsfile, "#pps_index sample_index   unix_time\n");
-        fflush(ppsfile);
+                outputbuf_samples / double(options->pcmrate));
     }
 
     // Prepare output writer.
-    unique_ptr<AudioOutput> audio_output;
-    switch (outmode) {
-        case MODE_RAW:
-            fprintf(stderr, "writing raw 16-bit audio samples to '%s'\n",
-                    filename.c_str());
-            audio_output.reset(new RawAudioOutput(filename));
-            break;
-        case MODE_WAV:
-            fprintf(stderr, "writing audio samples to '%s'\n",
-                    filename.c_str());
-            audio_output.reset(new WavAudioOutput(filename, pcmrate, stereo));
-            break;
-        case MODE_ALSA:
-            fprintf(stderr, "playing audio to ALSA device '%s'\n",
-                    alsadev.c_str());
-            audio_output.reset(new AlsaAudioOutput(alsadev, pcmrate, stereo));
-            break;
-    }
-
-    if (!(*audio_output)) {
-        fprintf(stderr, "ERROR: AudioOutput: %s\n",
-                        audio_output->error().c_str());
-        exit(1);
-    }
+    unique_ptr<AudioOutput> audio_output(create_audio_output_from_options(options));
 
     // If buffering enabled, start background output thread.
     DataBuffer<Sample> output_buffer;
     thread output_thread;
     if (outputbuf_samples > 0) {
-        unsigned int nchannel = stereo ? 2 : 1;
+        unsigned int nchannel = options->stereo ? 2 : 1;
         output_thread = thread(write_output_data,
                                audio_output.get(),
                                &output_buffer,
@@ -594,12 +615,23 @@ int main(int argc, char **argv)
 
     double block_time = get_time();
 
+    // Prepare decoder.
+    FmDecoder fm(options->ifrate,                            // sample_rate_if
+                 options->freq - options->tuner_freq,                 // tuning_offset
+                 options->pcmrate,                           // sample_rate_pcm
+                 options->stereo,                            // stereo
+                 FmDecoder::default_deemphasis,     // deemphasis,
+                 FmDecoder::default_bandwidth_if,   // bandwidth_if
+                 FmDecoder::default_freq_dev,       // freq_dev
+                 bandwidth_pcm,                     // bandwidth_pcm
+                 downsample);                       // downsample
+
     // Main loop.
     for (unsigned int block = 0; !stop_flag.load(); block++) {
 
         // Check for overflow of source buffer.
         if (!inbuf_length_warning &&
-            source_buffer.queued_samples() > 10 * ifrate) {
+            source_buffer.queued_samples() > 10 * options->ifrate) {
             fprintf(stderr,
                     "\nWARNING: Input buffer is growing (system too slow)\n");
             inbuf_length_warning = true;
@@ -633,11 +665,11 @@ int main(int argc, char **argv)
                 20*log10(fm.get_baseband_level()) + 3.01,
                 20*log10(audio_level) + 3.01);
         if (outputbuf_samples > 0) {
-            unsigned int nchannel = stereo ? 2 : 1;
+            unsigned int nchannel = options->stereo ? 2 : 1;
             size_t buflen = output_buffer.queued_samples();
             fprintf(stderr,
                     " buf=%.1fs ",
-                    buflen / nchannel / double(pcmrate));
+                    buflen / nchannel / double(options->pcmrate));
         }
         fflush(stderr);
 
